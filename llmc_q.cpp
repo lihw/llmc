@@ -1,5 +1,10 @@
 /* Inference for Llama-2 Transformer model in pure C, int8 quantized forward pass. */
 
+#include "q_tensor.h"
+#include "q_neural.h"
+
+#include <fmt/core.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -32,33 +37,29 @@ typedef struct {
     int seq_len; // max sequence length
 } Config;
 
-typedef struct {
-    int8_t* q;    // quantized values
-    float* s; // scaling factors
-} QuantizedTensor;
 
-typedef struct {
+struct TransformerWeights {
     // token embedding table
-    QuantizedTensor *q_tokens; // (vocab_size, dim)
+    q::Tensor *q_tokens; // (vocab_size, dim)
     float* token_embedding_table; // same, but dequantized
 
     // weights for rmsnorms
     float* rms_att_weight; // (layer, dim) rmsnorm weights
     float* rms_ffn_weight; // (layer, dim)
     // weights for matmuls. note dim == n_heads * head_size
-    QuantizedTensor *wq; // (layer, dim, n_heads * head_size)
-    QuantizedTensor *wk; // (layer, dim, n_kv_heads * head_size)
-    QuantizedTensor *wv; // (layer, dim, n_kv_heads * head_size)
-    QuantizedTensor *wo; // (layer, n_heads * head_size, dim)
+    q::Tensor *wq; // (layer, dim, n_heads * head_size)
+    q::Tensor *wk; // (layer, dim, n_kv_heads * head_size)
+    q::Tensor *wv; // (layer, dim, n_kv_heads * head_size)
+    q::Tensor *wo; // (layer, n_heads * head_size, dim)
     // weights for ffn
-    QuantizedTensor *w1; // (layer, hidden_dim, dim)
-    QuantizedTensor *w2; // (layer, dim, hidden_dim)
-    QuantizedTensor *w3; // (layer, hidden_dim, dim)
+    q::Tensor *w1; // (layer, hidden_dim, dim)
+    q::Tensor *w2; // (layer, dim, hidden_dim)
+    q::Tensor *w3; // (layer, hidden_dim, dim)
     // final rmsnorm
     float* rms_final_weight; // (dim,)
     // (optional) classifier weights for the logits, on the last layer
-    QuantizedTensor *wcls;
-} TransformerWeights;
+    q::Tensor *wcls;
+};
 
 typedef struct {
     // current wave of activations
@@ -67,16 +68,16 @@ typedef struct {
     float *xb2; // an additional buffer just for convenience (dim,)
     float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
     float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-    QuantizedTensor xq; // quantized x (dim,)
-    QuantizedTensor hq; // quantized hb (hidden_dim,)
+    q::Tensor xq; // quantized x (dim,)
+    q::Tensor hq; // quantized hb (hidden_dim,)
     float *q; // query (dim,)
     float *k; // key (dim,)
     float *v; // value (dim,)
     float *att; // buffer for scores/attention values (n_heads, seq_len)
     float *logits; // output logits
     // kv cache
-    float* key_cache;   // (layer, seq_len, dim)
-    float* value_cache; // (layer, seq_len, dim)
+    float* kcache;   // (layer, seq_len, dim)
+    float* vcache; // (layer, seq_len, dim)
 } RunState;
 
 typedef struct {
@@ -97,19 +98,18 @@ void malloc_run_state(RunState* s, Config* p) {
     s->xb2 = (float*)calloc(p->dim, sizeof(float));
     s->hb = (float*)calloc(p->hidden_dim, sizeof(float));
     s->hb2 = (float*)calloc(p->hidden_dim, sizeof(float));
-    s->xq = { .q = (int8_t*)calloc(p->dim, sizeof(int8_t)), .s = (float*)calloc(p->dim, sizeof(float)) };
-    s->hq = { .q = (int8_t*)calloc(p->hidden_dim, sizeof(int8_t)), .s = (float*)calloc(p->hidden_dim, sizeof(float)) };
+    s->xq = { .q = (int8_t*)calloc(p->dim, sizeof(int8_t)), .s = (float*)calloc(p->dim, sizeof(float)), .rows = p->dim, .cols = 1, };
+    s->hq = { .q = (int8_t*)calloc(p->hidden_dim, sizeof(int8_t)), .s = (float*)calloc(p->hidden_dim, sizeof(float)), .rows = p->hidden_dim, .cols = 1 };
     s->q = (float*)calloc(p->dim, sizeof(float));
     s->k = (float*)calloc(kv_dim, sizeof(float));
     s->v = (float*)calloc(kv_dim, sizeof(float));
     s->att = (float*)calloc(p->n_heads * p->seq_len, sizeof(float));
     s->logits = (float*)calloc(p->vocab_size, sizeof(float));
-    s->key_cache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    s->kcache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    s->vcache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->k || !s->v || !s->att || !s->logits || !s->key_cache
-     || !s->value_cache) {
+     || !s->k || !s->v || !s->att || !s->logits || !s->kcache || !s->vcache) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
@@ -130,62 +130,84 @@ void free_run_state(RunState* s) {
     free(s->v);
     free(s->att);
     free(s->logits);
-    free(s->key_cache);
-    free(s->value_cache);
+    free(s->kcache);
+    free(s->vcache);
 }
 
-// ----------------------------------------------------------------------------
-// Quantization functions
+void dumpWeights(const char* dump, TransformerWeights* w, Config* p) {
+    FILE* file = fopen(dump, "w");
 
-void dequantize(QuantizedTensor *qx, float* x, int n) {
-    for (int i = 0; i < n; i++) {
-        x[i] = qx->q[i] * qx->s[i / GS];
-    }
-}
+#define out stdout
 
-void quantize(QuantizedTensor *qx, float* x, int n) {
-    int num_groups = n / GS;
-    float Q_MAX = 127.0f;
+    auto printTensor = [](q::Tensor* q, size_t rows, size_t cols, const char* name) {
+        int8_t* v = q->q;
+        float* s = q->s;
 
-    for (int group = 0; group < num_groups; group++) {
+        size_t n = rows * cols;
 
-        // find the max absolute value in the current group
-        float wmax = 0.0;
-        for (int i = 0; i < GS; i++) {
-            float val = fabs(x[group * GS + i]);
-            if (val > wmax) {
-                wmax = val;
-            }
+        auto t = fmt::format("{}: [{}, {}]", name, rows, cols);
+
+        for (int j = 0; j < 5; j++) {
+            t += fmt::format("{:3d}, ", v[j]);
         }
+        t += fmt::format("{:3d}, ", v[n - 1]);
 
-        // calculate and write the scaling factor
-        float scale = wmax / Q_MAX;
-        qx->s[group] = scale;
-
-        // calculate and write the quantized values
-        for (int i = 0; i < GS; i++) {
-            float quant_value = x[group * GS + i] / scale; // scale
-            int8_t quantized = (int8_t) round(quant_value); // round and clamp
-            qx->q[group * GS + i] = quantized;
+        for (int j = 0; j < 5; j++) {
+            t += fmt::format("{:5.3f}, ", s[j]);
         }
+        t += fmt::format("{:5.3f}, ", s[n / GS - 1]);
+
+        fprintf(out, "%s\n", t.c_str());
+        };
+
+    for (int l = 0; l < p->n_layers; l++) {
+
+        fprintf(stdout, "==== layer %d\n", l);
+
+        std::string t;
+        int8_t* v;
+        float* s;
+
+        auto* rms_att_weight = w->rms_att_weight + l * p->dim;
+        t = fmt::format("{}: [{}, {}]", "rms_att_weight", p->dim, 1);
+        for (int j = 0; j < 5; j++) {
+            t += fmt::format("{:5.3f}, ", rms_att_weight[j]);
+        }
+        t += fmt::format("{:5.3f}, ", rms_att_weight[p->dim - 1]);
+        fprintf(out, "%s\n", t.c_str());
+
+        auto* wq = w->wq + l;
+        printTensor(wq, p->dim, p->dim, "wq");
+        auto* wk = w->wk + l;
+        printTensor(wk, p->dim, p->dim, "wk");
+        auto* wv = w->wv + l;
+        printTensor(wv, p->dim, p->dim, "wv");
+        auto* wo = w->wo + l;
+        printTensor(wo, p->dim, p->dim, "wo");
+
+        auto* w1 = w->w1 + l;
+        printTensor(w1, p->hidden_dim, p->dim, "w1");
+        auto* w2 = w->w2 + l;
+        printTensor(w2, p->dim, p->hidden_dim, "w2");
+        auto* w3 = w->w3 + l;
+        printTensor(w3, p->hidden_dim, p->dim, "w3");
+
+        auto* rms_ffn_weight = w->rms_ffn_weight + l * p->dim;
+        t = fmt::format("{}: [{}, {}]", "rms_ffn_weight", p->dim, 1);
+        for (int j = 0; j < 5; j++) {
+            t += fmt::format("{:5.3f}, ", rms_ffn_weight[j]);
+        }
+        t += fmt::format("{:5.3f}, ", rms_ffn_weight[p->dim - 1]);
+        fprintf(out, "%s\n", t.c_str());
     }
+
+    printTensor(w->wcls, p->vocab_size, p->dim, "wcls");
+
+    fclose(file);
+
+#undef out
 }
 
-/* initialize `n` x quantized tensor (with `size_each` elements), starting from memory pointed at *ptr */
-QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
-    void *p = *ptr;
-    QuantizedTensor *res = (QuantizedTensor*)malloc(n * sizeof(QuantizedTensor));
-    for(int i=0; i<n; i++) {
-        /* map quantized int8 values*/
-        res[i].q = (int8_t*)p;
-        p = (int8_t*)p + size_each;
-        /* map scale factors */
-        res[i].s = (float*)p;
-        p = (float*)p + size_each / GS;
-    }
-    *ptr = p; // advance ptr to current position
-    return res;
-}
 
 void memory_map_weights(TransformerWeights *w, Config* p, void* ptr, uint8_t shared_classifier) {
     int head_size = p->dim / p->n_heads;
@@ -200,22 +222,25 @@ void memory_map_weights(TransformerWeights *w, Config* p, void* ptr, uint8_t sha
 
     // now read all the quantized weights
     ptr = (void*)fptr; // now cast the pointer back to void*
-    w->q_tokens = init_quantized_tensors(&ptr, 1, p->vocab_size * p->dim);
+    w->q_tokens = q::init_quantized_tensors(&ptr, 1, p->vocab_size, p->dim);
     // dequantize token embedding table
     w->token_embedding_table = (float*)malloc(p->vocab_size * p->dim * sizeof(float));
-    dequantize(w->q_tokens, w->token_embedding_table, p->vocab_size * p->dim);
+    dequantize(w->q_tokens, w->token_embedding_table);
 
-    w->wq = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_heads * head_size));
-    w->wk = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * head_size));
-    w->wv = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * head_size));
-    w->wo = init_quantized_tensors(&ptr, p->n_layers, (p->n_heads * head_size) * p->dim);
+    w->wq = q::init_quantized_tensors(&ptr, p->n_layers, (p->n_heads * head_size), p->dim);
+    w->wk = q::init_quantized_tensors(&ptr, p->n_layers, (p->n_kv_heads * head_size), p->dim);
+    w->wv = q::init_quantized_tensors(&ptr, p->n_layers, (p->n_kv_heads * head_size), p->dim);
+    w->wo = q::init_quantized_tensors(&ptr, p->n_layers, p->dim, (p->n_heads * head_size));
 
-    w->w1 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim);
-    w->w2 = init_quantized_tensors(&ptr, p->n_layers, p->hidden_dim * p->dim);
-    w->w3 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim);
+    w->w1 = q::init_quantized_tensors(&ptr, p->n_layers, p->hidden_dim, p->dim);
+    w->w2 = q::init_quantized_tensors(&ptr, p->n_layers, p->dim, p->hidden_dim);
+    w->w3 = q::init_quantized_tensors(&ptr, p->n_layers, p->hidden_dim, p->dim);
 
-    w->wcls = shared_classifier ? w->q_tokens : init_quantized_tensors(&ptr, 1, p->dim * p->vocab_size);
+    w->wcls = shared_classifier ? w->q_tokens : q::init_quantized_tensors(&ptr, 1, p->vocab_size, p->dim);
+
+    //dumpWeights("dump.txt", w, p);
 }
+
 
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
                      int* fd, float** data, ssize_t* file_size) {
@@ -259,7 +284,7 @@ void build_transformer(Transformer *t, char* checkpoint_path) {
 }
 
 void free_transformer(Transformer* t) {
-    // free QuantizedTensors
+    // free q::Tensors
     free(t->weights.q_tokens);
     free(t->weights.token_embedding_table);
     free(t->weights.wq);
@@ -280,67 +305,6 @@ void free_transformer(Transformer* t) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
-void rmsnorm(float* o, float* x, float* weight, int size) {
-    // calculate sum of squares
-    float ss = 0.0f;
-    for (int j = 0; j < size; j++) {
-        ss += x[j] * x[j];
-    }
-    ss /= size;
-    ss += 1e-5f;
-    ss = 1.0f / sqrtf(ss);
-    // normalize and scale
-    for (int j = 0; j < size; j++) {
-        o[j] = weight[j] * (ss * x[j]);
-    }
-}
-
-void softmax(float* x, int size) {
-    // find max value (for numerical stability)
-    float max_val = x[0];
-    for (int i = 1; i < size; i++) {
-        if (x[i] > max_val) {
-            max_val = x[i];
-        }
-    }
-    // exp and sum
-    float sum = 0.0f;
-    for (int i = 0; i < size; i++) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
-    }
-    // normalize
-    for (int i = 0; i < size; i++) {
-        x[i] /= sum;
-    }
-}
-
-void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
-    // inputs to this function are both quantized
-
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-
-        float val = 0.0f;
-        int32_t ival = 0;
-        int in = i * n;
-
-        // do the matmul in groups of GS
-        int j;
-        for (j = 0; j <= n - GS; j += GS) {
-            for (int k = 0; k < GS; k++) {
-                ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
-            }
-            val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
-            ival = 0;
-        }
-
-        xout[i] = val;
-    }
-}
 
 float* forward(Transformer* transformer, int token, int pos) {
 
@@ -354,130 +318,99 @@ float* forward(Transformer* transformer, int token, int pos) {
     int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
     int hidden_dim =  p->hidden_dim;
     int head_size = dim / p->n_heads;
+    float norm = sqrtf(head_size);
 
     // copy the token embedding into x
     memcpy(x, w->token_embedding_table + token*dim, dim * sizeof(float));
 
     // forward all the layers
     for(int l = 0; l < p->n_layers; l++) {
-
         // attention rmsnorm
-        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+        q::rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
 
         // qkv matmuls for this position
-        quantize(&s->xq, s->xb, dim);
-        matmul(s->q, &s->xq, w->wq + l, dim, dim);
-        matmul(s->k, &s->xq, w->wk + l, dim, kv_dim);
-        matmul(s->v, &s->xq, w->wv + l, dim, kv_dim);
+        q::quantize(&s->xq, s->xb);
+        q::matmul(s->q, &s->xq, w->wq + l);
+        q::matmul(s->k, &s->xq, w->wk + l);
+        q::matmul(s->v, &s->xq, w->wv + l);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
-        for (int i = 0; i < dim; i+=2) {
-            int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-            float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
-            int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-            for (int v = 0; v < rotn; v++) {
-                float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
-                float v0 = vec[i];
-                float v1 = vec[i+1];
-                vec[i]   = v0 * fcr - v1 * fci;
-                vec[i+1] = v0 * fci + v1 * fcr;
-            }
-        }
+        q::rope(s->q, s->k, pos, dim, kv_dim, head_size);
 
         // save key,value at this time step (pos) to our kv cache
-        int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
-        float* key_cache_row = s->key_cache + loff + pos * kv_dim;
-        float* value_cache_row = s->value_cache + loff + pos * kv_dim;
-        memcpy(key_cache_row, s->k, kv_dim * sizeof(*key_cache_row));
-        memcpy(value_cache_row, s->v, kv_dim * sizeof(*value_cache_row));
+        // Add current timestamp k and v to kv cache
+        float* kcache = s->kcache + p->seq_len * l * kv_dim;
+        float* vcache = s->vcache + p->seq_len * l * kv_dim;
+        memcpy(kcache + pos * kv_dim, s->k, sizeof(float) * kv_dim);
+        memcpy(vcache + pos * kv_dim, s->v, sizeof(float) * kv_dim);
 
         // multihead attention. iterate over all heads
         int h;
         #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
-            // get the query vector for this head
-            float* q = s->q + h * head_size;
             // attention scores for this head
             float* att = s->att + h * p->seq_len;
-            // iterate over all timesteps, including the current one
+            // iterate over all timesteps, including the current one, compute the
+            // kq of current head. 
+            // FIXME: the kv_dim == dim
             for (int t = 0; t <= pos; t++) {
-                // get the key vector for this head and at this timestep
-                float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // calculate the attention score as the dot product of q and k
-                float score = 0.0f;
-                for (int i = 0; i < head_size; i++) {
-                    score += q[i] * k[i];
-                }
-                score /= sqrtf(head_size);
+                float score = q::dot(kcache + t * kv_dim, s->q, h * head_size, 
+                        (h + 1) * head_size);
+                score /= norm;
                 // save the score to the attention buffer
                 att[t] = score;
             }
 
             // softmax the scores to get attention weights, from 0..pos inclusively
-            softmax(att, pos + 1);
+            q::softmax(att, pos + 1);
 
             // weighted sum of the values, store back into xb
             float* xb = s->xb + h * head_size;
             memset(xb, 0, head_size * sizeof(float));
             for (int t = 0; t <= pos; t++) {
-                // get the value vector for this head and at this timestep
-                float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // get the attention weight for this timestep
-                float a = att[t];
-                // accumulate the weighted value into xb
-                for (int i = 0; i < head_size; i++) {
-                    xb[i] += a * v[i];
-                }
+                q::scale1(s->xb, vcache + t * kv_dim, att[t], 
+                        head_size * h, head_size * (h + 1));
             }
         }
 
         // final matmul to get the output of the attention
-        quantize(&s->xq, s->xb, dim);
-        matmul(s->xb2, &s->xq, w->wo + l, dim, dim);
+        q::quantize(&s->xq, s->xb);
+        q::matmul(s->xb2, &s->xq, w->wo + l);
 
         // residual connection back into x
-        for (int i = 0; i < dim; i++) {
-            x[i] += s->xb2[i];
+        q::add1(x, s->xb2, dim);
+        
+        if (pos == 1) {
+            q::dumpVector(x, dim, "x1");
         }
 
         // ffn rmsnorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
-
+        q::rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+        
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        quantize(&s->xq, s->xb, dim);
-        matmul(s->hb, &s->xq, w->w1 + l, dim, hidden_dim);
-        matmul(s->hb2, &s->xq, w->w3 + l, dim, hidden_dim);
+        q::quantize(&s->xq, s->xb);
+        q::matmul(s->hb, &s->xq, w->w1 + l);
+        q::matmul(s->hb2, &s->xq, w->w3 + l);
 
         // SwiGLU non-linearity
-        for (int i = 0; i < hidden_dim; i++) {
-            float val = s->hb[i];
-            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            val *= (1.0f / (1.0f + expf(-val)));
-            // elementwise multiply with w3(x)
-            val *= s->hb2[i];
-            s->hb[i] = val;
-        }
-
+        q::swiglu(s->hb, s->hb2, hidden_dim);
+        
         // final matmul to get the output of the ffn
-        quantize(&s->hq, s->hb, hidden_dim);
-        matmul(s->xb, &s->hq, w->w2 + l, hidden_dim, dim);
-
+        q::quantize(&s->hq, s->hb);
+        q::matmul(s->xb, &s->hq, w->w2 + l);
+        
         // residual connection
-        for (int i = 0; i < dim; i++) {
-            x[i] += s->xb[i];
-        }
+        q::add1(x, s->xb, dim);
     }
 
     // final rmsnorm
-    rmsnorm(x, x, w->rms_final_weight, dim);
-
+    q::rmsnorm(x, x, w->rms_final_weight, dim);
+        
     // classifier into logits
-    quantize(&s->xq, x, dim);
-    matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size);
+    q::quantize(&s->xq, x);
+    q::matmul(s->logits, &s->xq, w->wcls);
+
     return s->logits;
 }
 
@@ -819,7 +752,7 @@ int sample(Sampler* sampler, float* logits) {
         // apply the temperature to the logits
         for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
         // apply softmax to the logits to get the probabilities for next token
-        softmax(logits, sampler->vocab_size);
+        q::softmax(logits, sampler->vocab_size);
         // flip a (float) coin (this is our source of entropy for sampling)
         float coin = random_f32(&sampler->rng_state);
         // we sample from this distribution to get the next token
