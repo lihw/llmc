@@ -74,6 +74,16 @@ float dot(const float* a, const float* b, size_t start, size_t end) {
     return sum;
 }
 
+// out = x * scale;
+void scale(float* out, const float* x, float scale, size_t start, size_t end) {
+    for (auto i = start; i < end; i += 4) {
+        out[i]     = x[i] * scale;
+        out[i + 1] = x[i + 1] * scale;
+        out[i + 2] = x[i + 2] * scale;
+        out[i + 3] = x[i + 3] * scale;
+    }
+}
+
 // out += x * scale
 void scale1(float* out, const float* x, float scale, size_t start, size_t end) {
     for (auto i = start; i < end; i += 4) {
