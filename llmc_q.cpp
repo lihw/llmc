@@ -634,7 +634,7 @@ int sample(q::Sampler* sampler, float* logits) {
     } else {
         // apply the temperature to the logits
         q::scale(logits, logits, 1.0f / sampler->temperature, 0, sampler->vocab_size);
-        q::dumpVector(logits, sampler->vocab_size, "logits");
+        //q::dumpVector(logits, sampler->vocab_size, "logits");
         // apply softmax to the logits to get the probabilities for next token
         q::softmax(logits, sampler->vocab_size);
         // flip a (float) coin (this is our source of entropy for sampling)
